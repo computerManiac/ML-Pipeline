@@ -1,3 +1,4 @@
+from os import remove
 import dash
 import dash_core_components as dcc
 import dash_html_components as html
@@ -13,6 +14,9 @@ import pandas as pd
 from pipeline import pipeline
 import numpy as np
 from sklearn.metrics import mean_absolute_error
+import time
+from copy import deepcopy
+from datetime import datetime
 
 FA = "https://use.fontawesome.com/releases/v5.12.1/css/all.css"
 
@@ -23,27 +27,67 @@ app = dash.Dash(
     ]
 )
 
+edge_mode = False
+remove_edge = False
+remove_node = False
+run1,run2,run3,run4 = False,False,False,False
+
 nodes = [{'id': 'node-data', 'label': 'Data', 'size':15, 'shape': 'dot'},
         {'id': 'node-feature', 'label': 'Features', 'size':15, 'shape': 'dot'},
         {'id': 'node-model', 'label': 'Model', 'size':15, 'shape': 'dot'},
         {'id': 'node-output', 'label': 'Output', 'size':15, 'shape': 'dot'},
 ]
 
+nodes_orig = deepcopy(nodes)
+
 edges = [{'id': 'data-feature', 'from':'node-data', 'to':'node-feature', 'width':3},
         {'id': 'feature-model', 'from':'node-feature', 'to':'node-model', 'width':3},
         {'id': 'model-output', 'from':'node-model', 'to':'node-output', 'width':3}
 ]
 
+edges_orig = deepcopy(edges)
 
 app.layout = html.Div(
     children=[
-        html.Div(children=[visdcc.Network(id = 'net', data={'nodes': nodes, 'edges': edges}, 
+        html.Div(children=[dbc.Row(
+            [
+                dbc.Col(html.Div(children=[
+                    html.H5(
+                    children="Nodes", className="panel-title"
+                    ),
+                    html.Hr(style={'color': 'white', 'background': 'white', 'maxWidth': '90%'}),
+                    dbc.ButtonGroup([
+                                    dbc.Button("Logger", color="primary", id='logger', n_clicks=0), 
+                                    dbc.Button("Viz", color="primary", id='viz', n_clicks=0),
+                                    dbc.Button("Transform", color="primary", id='transform', n_clicks=0)
+                                    ], size='sm'),
+                    dbc.Button("Remove Node", color="danger", className="mr-1",  block=True, id="remove-node", n_clicks_timestamp=0, style={'marginTop':'10px'}),
+                    html.Div(children=[],style={'height':'5%'}),
+                    html.H5(
+                    children="Edges", className="panel-title"
+                    ),
+                    html.Hr(style={'color': 'white', 'background': 'white', 'maxWidth': '90%'}),
+                    html.Div(id='callback-out', style={'display':'none'}),
+                    html.Div(id='callback-out1', style={'display':'none'}),
+                    dbc.Button("+ Add Edge", color="info", className="mr-1",  block=True, id="add_edge", n_clicks=0),
+                    dbc.Button("Remove Edge", color="danger", className="mr-1",  block=True, id="remove-edge", n_clicks_timestamp=0, style={'marginTop':'10px'}),
+                ], style={'background':'#423e3e', 'height':'1000px', 'padding':'5px'}), width=2),
+                dbc.Col(visdcc.Network(id = 'net', data={'nodes': nodes, 'edges': edges}, 
                                         options={'height': '750px', 'width':'100%', 'edges':{
                                             'arrows':{
                                                 'to': {'enabled': True, 'type': 'arrow'}
+                                            }},
+                                            'layout': {
+                                                'randomSeed' : 6789,
+                                                # 'hierarchical': {'direction': 'LR'}
+                                            },
+                                            'interaction': {
+                                                'multiselect': True
                                             }
-                                        }}),], 
-                style={'height':'100vh', 'width':'100vw', 'overflow':'hidden', 'zIndex':-1}),
+                                            }))
+            ]
+        )], 
+                style={'height':'100vh', 'width':'100vw', 'overflow':'hidden'}),
         dbc.Modal(
             [
                 dbc.ModalHeader(children=[
@@ -61,7 +105,7 @@ app.layout = html.Div(
                         options=[
                             {"label": "Run Downstream", "value": "downstream_yes"},
                         ],
-                        value=['downstream_yes'],
+                        value=[],
                         id="switches-input",
                         switch=True,
                         inline=True
@@ -110,7 +154,7 @@ app.layout = html.Div(
                         options=[
                             {"label": "Run Downstream", "value": "downstream_yes"},
                         ],
-                        value=['downstream_yes'],
+                        value=[],
                         id="switches-input-1",
                         switch=True,
                         inline=True
@@ -249,6 +293,10 @@ def display_file(content, name, date):
 )
 
 def open_modal(x):
+    global edge_mode, remove_node
+    if edge_mode or remove_node:
+        print('In edge/node add mode, no modal will be opened')
+        return [False, False, False, False]
 
     if type(x) == type(None):
         return [False, False, False, False]
@@ -269,28 +317,97 @@ def open_modal(x):
 
 @app.callback(
     [Output('net', 'data'), Output('output-console', 'children'), Output('sample-btn', 'disabled')],
-    [Input('data-run', 'n_clicks_timestamp'),Input('feature-run', 'n_clicks_timestamp'),Input('model-run', 'n_clicks_timestamp'),
-    Input('split-slider', 'value')],
-    [State('x_columns', 'value'), State('y_column', 'value'),]
+    [Input('net', 'selection'),Input('data-run', 'n_clicks_timestamp'),Input('feature-run', 'n_clicks_timestamp'),Input('model-run', 'n_clicks_timestamp'),
+    Input('split-slider', 'value'),Input('logger', 'n_clicks'),Input('viz', 'n_clicks'),Input('transform', 'n_clicks')],
+    [State('x_columns', 'value'), State('y_column', 'value'), State('switches-input', 'value'), State('switches-input-1', 'value')]
 )
-def run_pipeline(btn1,btn2,btn3,val,x_cols,y_col):
-    global nodes,edges
-    if int(btn1) > int(btn2) and int(btn1) > int(btn3):
+def run_pipeline(selection,btn1,btn2,btn3,val,x_cols,y_col,run_down1,run_down2,nclicks1,nclicks2,nclicks3):
+    global nodes,edges,run1,run2,run3,run4,edge_mode,remove_node,remove_edge,nodes_orig,edges_orig
+
+    ctx = dash.callback_context
+
+    if (ctx.triggered):
+        button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+
+        if button_id == 'logger':
+            nodes.append({'id': 'node-logger', 'label': 'Logger', 'size':15, 'shape': 'dot'})
+            nodes_orig.append({'id': 'node-logger', 'label': 'Logger', 'size':15, 'shape': 'dot'})
+        elif button_id == 'viz':
+            nodes.append({'id': 'node-viz', 'label': 'Visualization', 'size':15, 'shape': 'dot'})
+            nodes_orig.append({'id': 'node-viz', 'label': 'Visualization', 'size':15, 'shape': 'dot'})
+        elif button_id == 'transform':
+            nodes.append({'id': 'node-transform', 'label': 'Transformation', 'size':15, 'shape': 'dot'})
+            nodes_orig.append({'id': 'node-transform', 'label': 'Transformation', 'size':15, 'shape': 'dot'})
+    
+    if type(selection) != type(None):
+        #remove node
+        if len(selection['nodes']) > 0 and remove_node:
+            for i in range(len(nodes)):
+                if nodes[i]['id'] == selection['nodes'][0]:
+                    nodes.pop(i)
+                    nodes_orig.pop(i)
+                    break
+            print('removed node', selection['nodes'][0])
+            remove_node = False
+        
+        #remove edge
+        if len(selection['edges']) > 0 and remove_edge:
+            for i in range(len(edges)):
+                if edges[i]['id'] == selection['edges'][0]:
+                    edges.pop(i)
+                    edges_orig.pop(i)
+                    break
+            print('removed edge', selection['edges'][0])
+            remove_edge = False
+
+
+        if len(selection['nodes']) > 1 and edge_mode:
+            edge_mode = False
+            print('adding edge...')
+            #make sure edge doesn't exist
+            node1,node2 = selection['nodes'][0],selection['nodes'][1]
+            for e in edges:
+                if e['from'] == node1 and e['to'] == node2:
+                    print('edge already exists..')
+                    return [{'nodes':nodes, 'edges':edges}, [], True]
+            #new edge
+            edges.append({'id': node1+'-'+node2, 'from':node1, 'to':node2, 'width':3})
+            edges_orig.append({'id': node1+'-'+node2, 'from':node1, 'to':node2, 'width':3})
+            print('added edge b/w ', node1, node2)
+         
+
+    if (int(btn1) > int(btn2) and int(btn1) > int(btn3)):
         #run data-node
+        nodes = deepcopy(nodes_orig)
+        edges = deepcopy(edges_orig)
         nodes[0]['color'] = 'green'
         globals()['pipeline'] = pipeline(globals()['df'], (1-val/100))
         print('Initiated pipeline...')
-        return [{'nodes':nodes, 'edges':edges}, [], True]
-    elif int(btn2) > int(btn1) and int(btn2) > int(btn3):
+        if run_down1 == ["downstream_yes"]:
+            print('running downstream from data node')
+            run2 = True
+            run3 = True
+        else:
+            return [{'nodes':nodes, 'edges':edges}, [], True]
+    if (int(btn2) > int(btn1) and int(btn2) > int(btn3)) or run2:
         #run feature-node
+
         nodes[1]['color'] = 'green'
         if 'color' in nodes[0].keys():
             del nodes[0]['color']
         globals()['pipeline'].build_pipeline()
         print('Built pipeline...')  
-        return [{'nodes':nodes, 'edges':edges}, [], True]
-    elif int(btn3) > int(btn1) and int(btn3) > int(btn2):
+
+        if run_down2 == ["downstream_yes"]:
+            print('running downstream from feature node')
+            run3 = True
+        elif run2:
+            run2 = False
+        else:
+            return [{'nodes':nodes, 'edges':edges}, [], True]
+    if (int(btn3) > int(btn1) and int(btn3) > int(btn2)) or run3:
         #run model-node
+
         nodes[2]['color'] = 'green'
         nodes[3]['color'] = 'green'
         if 'color' in nodes[1].keys():
@@ -304,9 +421,33 @@ def run_pipeline(btn1,btn2,btn3,val,x_cols,y_col):
             html.H5([dbc.Badge("Accuracy", className="ml-1", color="success", style={'marginRight':'20px'}), "{:.3f}%".format(sc*100)]),
             html.H5([dbc.Badge("Mean Absolute Error", className="ml-1", color="warning", style={'marginRight':'20px'}), "{:.3f}".format(mae)]),
         ]
-
+        if run3:
+            run3 = False
+            nodes[1]['color'] = 'green'
+            nodes[0]['color'] = 'green'
         return [{'nodes':nodes, 'edges':edges}, output_console, False]
     return [{'nodes':nodes, 'edges':edges}, [], True]
+
+@app.callback(Output('callback-out', 'children'),Input('add_edge', 'n_clicks'))
+def add_edge(n_clicks):
+    global edge_mode
+    print(datetime.now(),n_clicks)
+    if n_clicks > 0:
+        print('entering edge mode...')
+        edge_mode = True
+
+@app.callback(Output('callback-out1', 'children'),[Input('remove-node', 'n_clicks_timestamp'), Input('remove-edge', 'n_clicks_timestamp')])
+def remove_net(btn1, btn2):
+    global remove_edge, remove_node
+
+    if int(btn1) > int(btn2):
+        print('entering node removal..')
+        remove_node = True
+        remove_edge = False
+    elif int(btn2) > int(btn1):
+        print('entering edge removal..')
+        remove_node = False
+        remove_edge = True
 
 @app.callback(
     Output('sample-output', 'children'),
